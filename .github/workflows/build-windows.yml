@@ -1,7 +1,10 @@
 name: build-windows
 on:
   push:
+    branches: [main]
   workflow_dispatch:
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: windows-latest
@@ -16,3 +19,14 @@ jobs:
         with:
           name: wb_quant-windows
           path: target/release/wb_quant.exe
+      - name: Publish exe to the windows-build branch
+        shell: bash
+        run: |
+          mkdir out && cp target/release/wb_quant.exe out/
+          cd out
+          git init -q -b windows-build
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add wb_quant.exe
+          git commit -q -m "wb_quant.exe built from ${GITHUB_SHA}"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git" windows-build
