@@ -26,16 +26,24 @@ macOS / Linux도 같은 명령으로 빌드됩니다.
 ## 사용법 (GUI)
 
 1. **Open target blot…** 으로 목적 단백질 이미지 열기 (TIFF/PNG/JPG/BMP, 창에 드래그&드롭도 가능)
-2. **1. Draw strip**: 한 줄의 밴드 전체(모든 레인)를 덮는 사각형을 드래그
-3. 레인 수 입력 → **2. Auto-detect lanes** (등간격 그리드를 신호에 맞춘 뒤 각 밴드 중심으로 보정 — 약한 레인이 있어도 안정적)
-   - 위치가 어긋나면 `Select / move` 로 레인을 끌어 이동, `Delete` 키로 삭제
+2. (필요하면) **Rotation**으로 사진 기울기 보정: 슬라이더(0.05° 단위), 숫자 직접 입력, `-1° / -0.1° / +0.1° / +1°` 버튼. 양수 = 시계방향.
+   `Grid`를 켜면 수평 가이드선이 표시되어 밴드를 수평에 맞추기 쉽습니다. 회전은 ImageJ Rotate와 같은 bilinear 보간이며, 레인 위치는 그대로 두고 회전된 이미지에서 다시 측정합니다.
+3. **1. Draw strip**: 한 줄의 밴드 전체(모든 레인)를 덮는 사각형을 드래그
+4. 레인 수 입력 → **2. Auto-detect lanes** (등간격 그리드를 신호에 맞춘 뒤 각 밴드 중심으로 보정 — 약한 레인이 있어도 안정적)
+   - 개별 레인 조정 (`Select / move` 도구, 자동 검출 후 자동으로 선택됨):
+     - 레인 안쪽을 드래그 → 이동
+     - 레인의 **테두리나 모서리**를 드래그 → 그 방향으로만 크기 조절 (커서 모양이 ↔ / ↕ / ⤡ 로 바뀌는 곳)
+     - 이미지에서 레인을 클릭한 뒤 **방향키** → 1 px씩 이동, **Shift+방향키** → 10 px
+     - 오른쪽 패널의 `x / y / w / h` 칸에 숫자를 직접 입력하거나 좌우로 드래그해서 미세 조정
+     - `Apply this size to all lanes` → 선택한 레인의 크기를 모든 레인에 적용 (각 레인 중심 유지)
+     - `Delete` 키 또는 `Delete lane` 버튼 → 삭제
    - 직접 그리고 싶으면 `Add lane`: 첫 레인을 드래그로 그리고, 이후 클릭할 때마다 같은 크기 레인이 추가됩니다(ImageJ Next Lane과 동일)
-4. 레인을 선택하면 오른쪽에 프로파일과 면적(주황색)이 표시됩니다.
+5. 레인을 선택하면 오른쪽에 프로파일과 면적(주황색)이 표시됩니다.
    피크 경계(녹색)는 자동 검출되며, 그래프를 클릭/드래그하면 가까운 경계가 이동합니다. 빨간 선 = baseline.
-5. **Open loading control…** 로 β-actin/GAPDH 등 이미지를 열고 같은 방법으로 레인 지정
+6. **Open loading control…** 로 β-actin/GAPDH 등 이미지를 열고 같은 방법으로 레인 지정
    (같은 이미지의 다른 줄이면 같은 파일을 열고 해당 줄에 strip을 그리면 됩니다. `Copy lanes from …` 으로 레인 배치 복사 가능)
-6. 하단 표에서 **Reference (control) lane** 지정 → `Normalized / ref` 가 최종 상대 발현량
-7. **Export CSV…** (설정·레인 좌표·피크 경계 포함) / **Copy table** (엑셀·Prism에 붙여넣기) / **Save lane overlay PNG…** (레인 번호와 피크 경계가 그려진 기록용 이미지)
+7. 하단 표에서 **Reference (control) lane** 지정 → `Normalized / ref` 가 최종 상대 발현량
+8. **Export CSV…** (설정·레인 좌표·피크 경계 포함) / **Copy table** (엑셀·Prism에 붙여넣기) / **Save lane overlay PNG…** (레인 번호와 피크 경계가 그려진 기록용 이미지)
 
 ### 결과 표 열
 - `Target area` : 밴드 면적 (signal × pixel, ImageJ wand 면적과 비례)
@@ -51,7 +59,7 @@ wb_quant.exe --cli target.tif --lanes 6 --strip 0,40,520,60 ^
              --lc actin.tif --lc-strip 0,130,520,60 --ref 1 ^
              --out results.csv --overlay target_lanes.png
 ```
-옵션: `--dir v|h` (레인 방향), `--invert auto|yes|no`, `--baseline line|min`, `--smooth N`.
+옵션: `--rotate DEG` / `--lc-rotate DEG` (회전, 양수=시계방향), `--dir v|h` (레인 방향), `--invert auto|yes|no`, `--baseline line|min`, `--smooth N`.
 `--strip` 을 생략하면 이미지 전체를 한 줄로 보고 레인을 찾습니다.
 
 테스트용 합성 블롯 생성: `wb_quant.exe --cli --demo demo_blot.png`

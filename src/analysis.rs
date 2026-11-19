@@ -84,6 +84,37 @@ impl GrayImage {
         s[idx]
     }
 
+    /// Rotate about the image centre by `deg` degrees (positive = clockwise on screen),
+    /// bilinear interpolation, same canvas size; uncovered corners get the median (background).
+    pub fn rotated(&self, deg: f32) -> GrayImage {
+        if deg.abs() < 1e-4 {
+            return self.clone();
+        }
+        let (w, h) = (self.width, self.height);
+        let fill = self.percentile(0.5);
+        let (cx, cy) = ((w as f32 - 1.0) / 2.0, (h as f32 - 1.0) / 2.0);
+        let (s, c) = deg.to_radians().sin_cos();
+        let mut data = vec![fill; w * h];
+        for y in 0..h {
+            let dy = y as f32 - cy;
+            for x in 0..w {
+                let dx = x as f32 - cx;
+                let sx = c * dx + s * dy + cx;
+                let sy = -s * dx + c * dy + cy;
+                if sx < 0.0 || sy < 0.0 || sx > (w - 1) as f32 || sy > (h - 1) as f32 {
+                    continue;
+                }
+                let (x0, y0) = (sx.floor() as usize, sy.floor() as usize);
+                let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
+                let (fx, fy) = (sx - x0 as f32, sy - y0 as f32);
+                let top = self.get(x0, y0) * (1.0 - fx) + self.get(x1, y0) * fx;
+                let bot = self.get(x0, y1) * (1.0 - fx) + self.get(x1, y1) * fx;
+                data[y * w + x] = top * (1.0 - fy) + bot * fy;
+            }
+        }
+        GrayImage { width: w, height: h, data, max_val: self.max_val, bit_depth: self.bit_depth }
+    }
+
     /// Light background (typical scanned blot with dark bands) -> invert.
     pub fn auto_invert(&self) -> bool {
         self.percentile(0.5) > self.max_val * 0.5
@@ -198,10 +229,12 @@ pub struct Params {
     pub baseline: BaselineMode,
     /// Moving-average window used only for automatic peak-boundary detection.
     pub smooth_win: usize,
+    /// Image rotation applied before measuring (degrees, positive = clockwise).
+    pub rotation: f32,
 }
 impl Default for Params {
     fn default() -> Self {
-        Self { dir: LaneDir::Vertical, invert: true, baseline: BaselineMode::Line, smooth_win: 5 }
+        Self { dir: LaneDir::Vertical, invert: true, baseline: BaselineMode::Line, smooth_win: 5, rotation: 0.0 }
     }
 }
 
@@ -572,7 +605,8 @@ fn q(s: &str) -> String {
 
 fn params_desc(p: &Params) -> String {
     format!(
-        "lanes={:?}; inverted={}; baseline={}; smoothing={}",
+        "rotation={:.2} deg; lanes={:?}; inverted={}; baseline={}; smoothing={}",
+        p.rotation,
         p.dir,
         p.invert,
         match p.baseline {
@@ -803,6 +837,23 @@ mod tests {
             let gotn = r.norm_rel.unwrap();
             assert!((gotn - exp_norm).abs() / exp_norm < 0.05, "lane {i}: {gotn} vs {exp_norm}");
         }
+    }
+
+    #[test]
+    fn rotation_levels_a_tilted_band() {
+        // horizontal dark line through the centre, rotated by +3 deg then back by -3 deg
+        let (w, h) = (201usize, 101usize);
+        let mut d = vec![230f32; w * h];
+        for x in 0..w {
+            d[50 * w + x] = 30.0;
+        }
+        let img = GrayImage::from_raw(w, h, d, 255.0);
+        let tilted = img.rotated(3.0);
+        // clockwise on screen: right end goes down
+        let col_min = |im: &GrayImage, x: usize| (0..h).min_by(|&a, &b| im.get(x, a).partial_cmp(&im.get(x, b)).unwrap()).unwrap();
+        assert!(col_min(&tilted, 190) > col_min(&tilted, 10) + 6);
+        let back = tilted.rotated(-3.0);
+        assert!((col_min(&back, 190) as i64 - col_min(&back, 10) as i64).abs() <= 1);
     }
 
     #[test]

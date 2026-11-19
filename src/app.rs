@@ -1,5 +1,5 @@
 use crate::analysis::{self as an, BaselineMode, GrayImage, InvertMode, Lane, LaneDir, Params, Rect};
-use eframe::egui::{self, Align2, Color32, FontId, Key, Pos2, Sense, Stroke, TextureHandle, TextureOptions, Vec2};
+use eframe::egui::{self, Align2, Color32, CursorIcon, FontId, Key, Pos2, Sense, Stroke, TextureHandle, TextureOptions, Vec2};
 use egui_plot::{Bar, BarChart, Line, Plot, PlotPoints, VLine};
 use std::path::PathBuf;
 
@@ -16,13 +16,38 @@ enum Drag {
     None,
     NewRect { start: (f32, f32), cur: (f32, f32), strip: bool },
     Move { idx: usize, off: (f32, f32) },
+    Resize { idx: usize, edges: Edges, orig: Rect, start: (f32, f32) },
+}
+
+/// Which edges of a lane rectangle are being dragged.
+#[derive(Clone, Copy, Default)]
+struct Edges {
+    l: bool,
+    r: bool,
+    t: bool,
+    b: bool,
+}
+
+impl Edges {
+    fn cursor(self) -> CursorIcon {
+        match (self.l, self.r, self.t, self.b) {
+            (true, _, true, _) | (_, true, _, true) => CursorIcon::ResizeNwSe,
+            (_, true, true, _) | (true, _, _, true) => CursorIcon::ResizeNeSw,
+            (true, _, _, _) | (_, true, _, _) => CursorIcon::ResizeHorizontal,
+            _ => CursorIcon::ResizeVertical,
+        }
+    }
 }
 
 struct Slot {
     title: &'static str,
     path: Option<PathBuf>,
+    /// Image as loaded (before rotation).
+    orig: Option<GrayImage>,
+    /// Image actually displayed and measured (rotated by params.rotation).
     img: Option<GrayImage>,
     tex: Option<TextureHandle>,
+    show_grid: bool,
     invert_mode: InvertMode,
     params: Params,
     lanes: Vec<Lane>,
@@ -40,8 +65,10 @@ impl Slot {
         Self {
             title,
             path: None,
+            orig: None,
             img: None,
             tex: None,
+            show_grid: false,
             invert_mode: InvertMode::Auto,
             params: Params::default(),
             lanes: Vec::new(),
@@ -57,14 +84,71 @@ impl Slot {
 
     fn load(&mut self, ctx: &egui::Context, path: PathBuf) -> Result<(), String> {
         let img = GrayImage::open(&path)?;
+        self.params.invert = self.invert_mode.resolve(&img);
+        self.params.rotation = 0.0;
+        self.orig = Some(img.clone());
+        self.set_image(ctx, img);
+        self.path = Some(path);
+        Ok(())
+    }
+
+    fn set_image(&mut self, ctx: &egui::Context, img: GrayImage) {
         let disp = img.display_u8();
         let ci = egui::ColorImage::from_gray([img.width, img.height], &disp);
-        self.tex = Some(ctx.load_texture(format!("img-{}", self.title), ci, TextureOptions::LINEAR));
-        self.params.invert = self.invert_mode.resolve(&img);
+        match &mut self.tex {
+            Some(t) => t.set(ci, TextureOptions::LINEAR),
+            None => self.tex = Some(ctx.load_texture(format!("img-{}", self.title), ci, TextureOptions::LINEAR)),
+        }
         self.img = Some(img);
-        self.path = Some(path);
         self.recompute_all();
-        Ok(())
+    }
+
+    /// Re-rotate the original image by params.rotation; lanes keep their positions.
+    fn apply_rotation(&mut self, ctx: &egui::Context) {
+        self.params.rotation = (self.params.rotation * 100.0).round() / 100.0;
+        if let Some(o) = &self.orig {
+            let img = o.rotated(self.params.rotation);
+            self.set_image(ctx, img);
+        }
+    }
+
+    /// Lane edge / corner under (x, y) — the selected lane is checked first.
+    fn edge_hit(&self, x: f32, y: f32, tol: f32) -> Option<(usize, Edges)> {
+        let mut order: Vec<usize> = (0..self.lanes.len()).rev().collect();
+        if let Some(s) = self.selected.filter(|&s| s < self.lanes.len()) {
+            order.retain(|&i| i != s);
+            order.insert(0, s);
+        }
+        for i in order {
+            let r = self.lanes[i].rect;
+            let (x0, x1, y0, y1) = (r.x, r.x + r.w, r.y, r.y + r.h);
+            if x < x0 - tol || x > x1 + tol || y < y0 - tol || y > y1 + tol {
+                continue;
+            }
+            let th = tol.min(r.w / 3.0);
+            let tv = tol.min(r.h / 3.0);
+            let e = Edges {
+                l: (x - x0).abs() <= th,
+                r: (x - x1).abs() <= th,
+                t: (y - y0).abs() <= tv,
+                b: (y - y1).abs() <= tv,
+            };
+            if e.l || e.r || e.t || e.b {
+                return Some((i, e));
+            }
+        }
+        None
+    }
+
+    fn nudge_selected(&mut self, dx: f32, dy: f32) {
+        let Some((w, h)) = self.dims() else { return };
+        if let Some(i) = self.selected.filter(|&i| i < self.lanes.len()) {
+            self.lanes[i].rect.x += dx;
+            self.lanes[i].rect.y += dy;
+            self.lanes[i].rect.clamp_to(w, h);
+            self.recompute(i);
+            self.sort_lanes();
+        }
     }
 
     fn dims(&self) -> Option<(usize, usize)> {
@@ -135,6 +219,8 @@ pub struct WbApp {
     active: usize,
     ref_lane: usize,
     status: String,
+    /// Id of the image canvas, so keyboard shortcuts work when it (or nothing) has focus.
+    canvas_id: Option<egui::Id>,
 }
 
 impl WbApp {
@@ -143,6 +229,7 @@ impl WbApp {
             slots: [Slot::new("Target protein"), Slot::new("Loading control")],
             active: 0,
             ref_lane: 1,
+            canvas_id: None,
             status: "Open a blot image (button above or drag & drop).".into(),
         };
         if let Some(p) = initial {
@@ -234,8 +321,37 @@ impl WbApp {
         }
         ui.separator();
 
+        let ctx = ui.ctx().clone();
         let mut changed = false;
+        let mut rot_changed = false;
         egui::Grid::new("params").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+            ui.label("Rotation");
+            ui.vertical(|ui| {
+                rot_changed |= ui
+                    .add(
+                        egui::Slider::new(&mut s.params.rotation, -15.0..=15.0)
+                            .step_by(0.05)
+                            .max_decimals(2)
+                            .suffix("°"),
+                    )
+                    .on_hover_text("Positive = clockwise. Type an exact value in the box, or drag.")
+                    .changed();
+                ui.horizontal(|ui| {
+                    for (label, d) in [("-1°", -1.0f32), ("-0.1°", -0.1), ("+0.1°", 0.1), ("+1°", 1.0)] {
+                        if ui.small_button(label).clicked() {
+                            s.params.rotation += d;
+                            rot_changed = true;
+                        }
+                    }
+                    if ui.small_button("Reset").clicked() {
+                        s.params.rotation = 0.0;
+                        rot_changed = true;
+                    }
+                    ui.checkbox(&mut s.show_grid, "Grid").on_hover_text("Guide lines to level the bands");
+                });
+            });
+            ui.end_row();
+
             ui.label("Invert");
             let label = |m: InvertMode| match m {
                 InvertMode::Auto => "Auto",
@@ -278,8 +394,11 @@ impl WbApp {
             ui.add(egui::Slider::new(&mut s.zoom, 0.25..=8.0).logarithmic(true).suffix("×"));
             ui.end_row();
         });
+        if rot_changed {
+            s.apply_rotation(&ctx);
+        }
         if changed {
-            if let Some(img) = &s.img {
+            if let Some(img) = &s.orig {
                 s.params.invert = s.invert_mode.resolve(img);
             }
             s.recompute_all();
@@ -295,8 +414,8 @@ impl WbApp {
         });
         ui.weak(match s.tool {
             Tool::Strip => "Drag a rectangle over one band row (all lanes), then auto-detect or split.",
-            Tool::AddLane => "No lanes: drag the first lane. Then click to add same-size lanes (ImageJ 'Next Lane').",
-            Tool::Select => "Click a lane to select, drag to move. Delete key removes it.",
+            Tool::AddLane => "No lanes: drag the first lane. Then click to add same-size lanes (ImageJ 'Next Lane'). Drag a lane edge to resize.",
+            Tool::Select => "Click a lane to select. Drag inside = move, drag an edge/corner = resize. Arrow keys nudge (Shift = 10 px). Delete removes.",
         });
 
         ui.horizontal(|ui| {
@@ -344,6 +463,10 @@ impl WbApp {
         ui.horizontal(|ui| {
             ui.strong(format!("Lane {}", i + 1));
             let l = &mut s.lanes[i];
+            ui.label("x");
+            lane_changed |= ui.add(egui::DragValue::new(&mut l.rect.x).speed(0.5).max_decimals(1)).changed();
+            ui.label("y");
+            lane_changed |= ui.add(egui::DragValue::new(&mut l.rect.y).speed(0.5).max_decimals(1)).changed();
             ui.label("w");
             lane_changed |= ui.add(egui::DragValue::new(&mut l.rect.w).range(2.0..=10000.0).speed(0.5).max_decimals(1)).changed();
             ui.label("h");
@@ -470,8 +593,21 @@ impl WbApp {
         let fit = (avail.x / fw).min(avail.y / fh).max(0.01);
         let scale = fit * s.zoom;
 
+        let mut canvas_id = None;
         egui::ScrollArea::both().auto_shrink([false, false]).drag_to_scroll(false).show(ui, |ui| {
             let (resp, painter) = ui.allocate_painter(Vec2::new(fw, fh) * scale, Sense::click_and_drag());
+            canvas_id = Some(resp.id);
+            if resp.clicked() || resp.drag_started() {
+                resp.request_focus(); // take keyboard focus from any previously clicked button
+            }
+            if resp.has_focus() {
+                ui.memory_mut(|m| {
+                    m.set_focus_lock_filter(
+                        resp.id,
+                        egui::EventFilter { horizontal_arrows: true, vertical_arrows: true, ..Default::default() },
+                    )
+                });
+            }
             let origin = resp.rect.min;
             let to_img = |p: Pos2| ((p.x - origin.x) / scale, (p.y - origin.y) / scale);
             let to_scr = |r: &Rect| {
@@ -488,10 +624,28 @@ impl WbApp {
             }
 
             // ---- mouse interaction
+            let tol = 6.0 / scale; // edge grab tolerance: 6 screen px, in image px
+            if let Drag::Resize { edges, .. } = &s.drag {
+                ui.ctx().set_cursor_icon(edges.cursor());
+            } else if s.tool != Tool::Strip && matches!(s.drag, Drag::None) {
+                if let Some(hp) = resp.hover_pos() {
+                    let (x, y) = to_img(hp);
+                    if let Some((_, e)) = s.edge_hit(x, y, tol) {
+                        ui.ctx().set_cursor_icon(e.cursor());
+                    } else if s.tool == Tool::Select && s.hit(x, y).is_some() {
+                        ui.ctx().set_cursor_icon(CursorIcon::Grab);
+                    }
+                }
+            }
             if resp.drag_started() {
                 if let Some(p0) = ui.input(|i| i.pointer.press_origin()) {
                     let (x, y) = to_img(p0);
-                    s.drag = match s.tool {
+                    let edge = if s.tool == Tool::Strip { None } else { s.edge_hit(x, y, tol) };
+                    s.drag = if let Some((idx, edges)) = edge {
+                        s.selected = Some(idx);
+                        Drag::Resize { idx, edges, orig: s.lanes[idx].rect, start: (x, y) }
+                    } else {
+                        match s.tool {
                         Tool::Strip => Drag::NewRect { start: (x, y), cur: (x, y), strip: true },
                         Tool::AddLane if s.lanes.is_empty() => Drag::NewRect { start: (x, y), cur: (x, y), strip: false },
                         Tool::AddLane => {
@@ -507,6 +661,7 @@ impl WbApp {
                             }
                             None => Drag::None,
                         },
+                        }
                     };
                 }
             }
@@ -521,6 +676,35 @@ impl WbApp {
                                 l.rect.x = x - off.0;
                                 l.rect.y = y - off.1;
                                 l.rect.clamp_to(iw, ih);
+                            }
+                            s.recompute(idx);
+                        }
+                        Drag::Resize { idx, edges, orig, start } => {
+                            let (idx, e, o) = (*idx, *edges, *orig);
+                            let (dx, dy) = (x - start.0, y - start.1);
+                            let min = 3.0;
+                            let mut r = o;
+                            if e.l {
+                                let nx = (o.x + dx).min(o.x + o.w - min);
+                                r.w = o.x + o.w - nx;
+                                r.x = nx;
+                            }
+                            if e.r {
+                                r.w = (o.w + dx).max(min);
+                            }
+                            if e.t {
+                                let ny = (o.y + dy).min(o.y + o.h - min);
+                                r.h = o.y + o.h - ny;
+                                r.y = ny;
+                            }
+                            if e.b {
+                                r.h = (o.h + dy).max(min);
+                            }
+                            let r = r.intersect_image(iw, ih);
+                            if let Some(l) = s.lanes.get_mut(idx) {
+                                if r.w >= min && r.h >= min {
+                                    l.rect = r;
+                                }
                             }
                             s.recompute(idx);
                         }
@@ -541,7 +725,7 @@ impl WbApp {
                             }
                         }
                     }
-                    Drag::Move { .. } => s.sort_lanes(),
+                    Drag::Move { .. } | Drag::Resize { .. } => s.sort_lanes(),
                     Drag::None => {}
                 }
             }
@@ -559,6 +743,22 @@ impl WbApp {
             }
 
             // ---- drawing
+            if s.show_grid {
+                let gc = Color32::from_rgba_unmultiplied(0, 170, 255, 90);
+                let step = (fh / 24.0).max(10.0);
+                let mut gy = step;
+                while gy < fh {
+                    let yy = origin.y + gy * scale;
+                    painter.line_segment([Pos2::new(resp.rect.left(), yy), Pos2::new(resp.rect.right(), yy)], Stroke::new(1.0_f32, gc));
+                    gy += step;
+                }
+                let mut gx = step;
+                while gx < fw {
+                    let xx = origin.x + gx * scale;
+                    painter.line_segment([Pos2::new(xx, resp.rect.top()), Pos2::new(xx, resp.rect.bottom())], Stroke::new(1.0_f32, gc.gamma_multiply(0.5)));
+                    gx += step;
+                }
+            }
             if let Some(st) = s.strip {
                 painter.rect_stroke(to_scr(&st), 0.0, Stroke::new(1.5_f32, Color32::from_rgb(0, 200, 255)));
             }
@@ -586,6 +786,9 @@ impl WbApp {
                 painter.rect_stroke(to_scr(&r), 0.0, Stroke::new(1.0_f32, c));
             }
         });
+        if canvas_id.is_some() {
+            self.canvas_id = canvas_id;
+        }
     }
 
     fn results(&mut self, ui: &mut egui::Ui) {
@@ -650,11 +853,27 @@ impl eframe::App for WbApp {
             self.load_into(ctx, self.active, p);
         }
         // Delete key removes the selected lane
-        if !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace)) {
+        let canvas_id = self.canvas_id;
+        let kb_ok = ctx.memory(|m| m.focused().is_none() || m.focused() == canvas_id);
+        if kb_ok && ctx.input(|i| i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace)) {
             let s = &mut self.slots[self.active];
             if let Some(i) = s.selected.filter(|&i| i < s.lanes.len()) {
                 s.lanes.remove(i);
                 s.selected = None;
+            }
+        }
+
+        // arrow keys nudge the selected lane (Shift = 10 px)
+        if kb_ok {
+            let (dx, dy) = ctx.input(|i| {
+                let st = if i.modifiers.shift { 10.0 } else { 1.0 };
+                let mut d = (0.0f32, 0.0f32);
+                d.0 += st * (i.num_presses(Key::ArrowRight) as f32 - i.num_presses(Key::ArrowLeft) as f32);
+                d.1 += st * (i.num_presses(Key::ArrowDown) as f32 - i.num_presses(Key::ArrowUp) as f32);
+                d
+            });
+            if dx != 0.0 || dy != 0.0 {
+                self.slots[self.active].nudge_selected(dx, dy);
             }
         }
 

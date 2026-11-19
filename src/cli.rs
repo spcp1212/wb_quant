@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 const USAGE: &str = "usage: wb_quant --cli <target_image> --lanes N [--strip x,y,w,h] \
 [--lc <loading_control_image>] [--lc-strip x,y,w,h] [--dir v|h] [--invert auto|yes|no] \
-[--baseline line|min] [--smooth N] [--ref N] [--out results.csv] [--overlay overlay.png]";
+[--baseline line|min] [--smooth N] [--ref N] [--rotate DEG] [--lc-rotate DEG] [--out results.csv] [--overlay overlay.png]";
 
 fn parse_rect(s: &str) -> Result<Rect, String> {
     let v: Vec<f32> = s
@@ -22,7 +22,7 @@ fn parse_rect(s: &str) -> Result<Rect, String> {
 }
 
 fn measure(path: &PathBuf, strip: Option<Rect>, n: usize, mut p: Params, inv: InvertMode) -> Result<(GrayImage, Vec<Lane>, Params), String> {
-    let img = GrayImage::open(path)?;
+    let img = GrayImage::open(path)?.rotated(p.rotation);
     p.invert = inv.resolve(&img);
     let strip = strip
         .unwrap_or(Rect::new(0.0, 0.0, img.width as f32, img.height as f32))
@@ -69,6 +69,7 @@ fn run_inner(args: &[String]) -> Result<(), String> {
     let mut p = Params::default();
     let mut inv = InvertMode::Auto;
     let mut ref_lane = 1usize;
+    let mut lc_rot: Option<f32> = None;
     let (mut out, mut overlay) = (None::<PathBuf>, None::<PathBuf>);
 
     let mut it = args.iter();
@@ -101,6 +102,8 @@ fn run_inner(args: &[String]) -> Result<(), String> {
                     o => return Err(format!("bad --baseline {o}")),
                 }
             }
+            "--rotate" => p.rotation = val()?.parse().map_err(|_| "bad --rotate")?,
+            "--lc-rotate" => lc_rot = Some(val()?.parse().map_err(|_| "bad --lc-rotate")?),
             "--smooth" => p.smooth_win = val()?.parse().map_err(|_| "bad --smooth")?,
             "--ref" => ref_lane = val()?.parse().map_err(|_| "bad --ref")?,
             "--out" => out = Some(PathBuf::from(val()?)),
@@ -116,7 +119,8 @@ fn run_inner(args: &[String]) -> Result<(), String> {
     let (timg, tl, tp) = measure(&target, strip, n, p, inv)?;
     let (ll, lp) = match &lc {
         Some(path) => {
-            let (_, l, pp) = measure(path, lc_strip, n, p, inv)?;
+            let lp0 = Params { rotation: lc_rot.unwrap_or(p.rotation), ..p };
+            let (_, l, pp) = measure(path, lc_strip, n, lp0, inv)?;
             (l, pp)
         }
         None => (Vec::new(), p),
